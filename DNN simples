@@ -1,0 +1,162 @@
+import numpy as np
+import theano.tensor as tt
+from theano import function, pp
+from theano.tensor import stacklists, scalars, matrices
+import re
+from theano.compile.io import In
+from theano import *
+from sklearn import datasets, model_selection
+from tensorflow.keras.utils import to_categorical
+
+class Modelo:
+    def __init__(self):
+        self.camadas = []
+        self.camadas_inicializacao = []
+    def add(self, camada):
+        self.camadas.append(camada)
+        self.camadas_inicializacao.append(camada.distribuicao_inicializante)
+        camada.nome = 'densa_' + str(len(self.camadas) + 1)
+    def fazer_variaveis(self, n_neuronios):
+        self.variaveis_shape = []
+        self.variaveis = {}
+        
+        mini_batch_size_nome = 'mini_batch_size'
+        self.var_mini_batch = tt.dscalar(mini_batch_size_nome)
+        self.variaveis['mini_batch_size'] = self.var_mini_batch
+        
+        n_saidas = self.camadas[-1].n_neuronios
+        target_placeholder = []
+        for i in range(n_saidas):
+            target_entrada = 'target_' + f'{i + 1}'
+            target = tt.dscalar(target_entrada)
+            target_placeholder.append(target)
+            self.variaveis[target_entrada] = target
+        self.entradas_target = np.array([target_placeholder])
+        
+        shape_entrada = self.camadas[0].n_neuronios
+        entradas_placeholder = []
+        for i in range(shape_entrada):
+            nome_entrada = 'entrada_' + f'{i + 1}'
+            entrada = tt.dscalar(nome_entrada)
+            entradas_placeholder.append(entrada)
+            self.variaveis[nome_entrada] = entrada
+        self.variaveis_shape.append(np.array([entradas_placeholder]))
+            
+        for index_camada in range(len(n_neuronios) - 1): # camada atual
+            neuronios_camada = []
+            for index_neuronio in range(n_neuronios[index_camada + 1]): # neuronio da camada posterior
+                pesos_neuronio = []
+                for index_peso in range((n_neuronios[index_camada])):  # peso
+                    peso_nome = 'peso_' + f'{index_camada + 1}_' + f'{index_neuronio + 1}_' + f'{index_peso + 1}'
+                    peso = tt.dscalar(peso_nome)
+                    pesos_neuronio.append(peso)
+                    self.variaveis[peso_nome] = peso
+                bias_nome = 'bias_' + str(index_camada + 1) + '_' + str(index_neuronio + 1)
+                bias = tt.dscalar(bias_nome)
+                pesos_neuronio.append(bias)
+                pesos_neuronio = np.array(pesos_neuronio)
+                neuronios_camada.append(pesos_neuronio)
+                self.variaveis[bias_nome] = bias
+            self.variaveis_shape.append(np.array(neuronios_camada))
+    def fazer_expressoes_rede(self):
+        entrada = self.variaveis_shape[0].T
+        saida_anterior = entrada
+        for camada in self.variaveis_shape[1:]:
+            features_com_uns = np.concatenate([saida_anterior, [[1]]], axis=0)
+            saida = camada @ features_com_uns
+            saida_anterior = saida
+        self.saida_rede = saida  
+    
+    def adicionar_funcao_custo(self,loss):
+        if loss == 'softmax':
+            n_saidas = self.camadas[-1].n_neuronios
+            self.probabilidades = []
+            for index_saida in range(n_saidas):
+                probabilidade = np.exp(self.saida_rede[index_saida][0]) / np.sum(np.exp(self.saida_rede))
+                self.probabilidades.append(np.log(probabilidade) * self.entradas_target[0][index_saida])
+            s = 0
+            for parte_custo in self.probabilidades:
+                s = s + parte_custo
+            self.saida_custo_funcao = (-1/self.var_mini_batch) * s          
+        
+    def instanciar_gradiente(self):
+        grad_saida = tt.grad(self.saida_custo_funcao, list(self.variaveis.values()))
+        self.gradiente_rede_funcao = function(list(self.variaveis.values()), grad_saida)
+        self.saida_custo_funcao_exec = function(list(self.variaveis.values()), self.saida_custo_funcao)
+    
+    def inicializar_valores_rede(self):
+        self.valores_parametros = []
+        for index in range(1, len(self.camadas_inicializacao)):
+            n_saida = self.variaveis_shape[index].shape[0]
+            n_entrada = self.variaveis_shape[index].shape[1] - 1
+            Range = np.sqrt(6 / (n_entrada + n_saida))
+            w = np.random.uniform(-Range, Range, size=(n_entrada, n_saida))
+            Range = np.sqrt(6 / n_saida) # n_saida = n_neuronios
+            b = np.random.uniform(-Range, Range, size=(n_saida,1))
+            self.valores_parametros.append(np.concatenate([w.T, b], axis=1))
+        array = np.array([[0]])
+        for matriz in self.valores_parametros:
+            array = np.concatenate([array, matriz.reshape((1,-1))], axis=1)
+        array = array[0][1:]
+        self.array_param = array
+    
+    def compilar(self,loss):
+        n_neuronios = [l.n_neuronios for l in self.camadas]
+        self.fazer_variaveis(n_neuronios)
+        self.fazer_expressoes_rede()
+        self.adicionar_funcao_custo(loss)
+        self.instanciar_gradiente()
+        self.inicializar_valores_rede()
+        
+    def treinar(self, features, target, passos=1, mini_batch=100, lr= 0.01):
+        self.mini_batch = mini_batch
+        self.lr = lr
+        self.registro_saidas = list()
+        size_batch = int(len(features) / mini_batch)
+        index = 0
+        for epoca in range(passos):
+            for n_batch in range(mini_batch):
+                if n_batch + 1 != mini_batch:
+                    entrada_batch = features[index:index + size_batch]
+                    target_batch = target[index:index + size_batch]
+                    index = index + size_batch
+                else:
+                    entrada_batch = features[index:]
+                    target_batch = target[index:]
+                saida_rede = self.forward(entrada_batch, target_batch, entrada_batch.shape[0])
+                self.registro_saidas.append(saida_rede)
+                
+    def forward(self, entrada, target, mini_batch):  
+        instancias = np.concatenate([target, entrada],axis=1)  
+        soma_gradiente = np.zeros(shape= (len(self.array_param),))
+        soma_erro = 0
+        index_inicio = 1 + entrada.shape[1] + target.shape[1]
+        for i in range(mini_batch): 
+            gradiente = self.gradiente_rede_funcao(self.mini_batch, *instancias[i], *self.array_param)
+            soma_gradiente = soma_gradiente + np.array(gradiente)[index_inicio:]
+            erro = self.saida_custo_funcao_exec(self.mini_batch, *instancias[i], *self.array_param)
+            soma_erro = soma_erro + erro    
+        self.array_param = self.array_param - soma_gradiente * self.lr
+        print(f'LOSS {soma_erro}')
+        
+class Densa:
+    def __init__(self, n_neuronios, distribuicao_inicializante= 'glorot_xavier'):
+        self.n_neuronios = n_neuronios
+        self.nome = ''
+        self.distribuicao_inicializante = distribuicao_inicializante
+        
+        
+x = datasets.load_iris().data
+y = datasets.load_iris().target.reshape((-1,1))
+y_one_hot = to_categorical(y, 3)
+xo, xf, yo, yf = model_selection.train_test_split(x,y_one_hot, train_size=1)
+features = np.concatenate([xo, xf],axis=0)
+target = np.concatenate([yo, yf],axis=0)
+
+modelo = Modelo()
+modelo.add(Densa(4)) # considere essa como a camada de entrada, ela não tem matriz
+modelo.add(Densa(1))
+modelo.add(Densa(3))
+modelo.compilar(loss='softmax')
+modelo.treinar(features, target, passos= 3, mini_batch= 10, lr= 0.1)
+
